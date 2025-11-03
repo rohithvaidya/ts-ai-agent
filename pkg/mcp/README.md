@@ -2,25 +2,8 @@
 
 This project implements a **Model Context Protocol (MCP)** that provides intelligent, real-time observability over Kubernetes clusters using **Prometheus metrics** and **LLM-based reasoning**.  
 
-It exposes monitoring tools (like CPU usage, pod anomalies, and disk pressure) as callable APIs that an **AI assistant** or **chatbot** can query using natural language.
+It exposes monitoring tools as callable APIs that an **AI assistant** or **chatbot** can query using natural language.
 
----
-
-## 🚀 Features
-
-- 🌐 Supports **multiple Prometheus instances** (multi-cluster setup)
-- 🤖 Integrated with **Ollama LLMs** (e.g., `qwen2.5-coder:14b`)
-- ⚙️ Built on **FastMCP** for tool registration and invocation
-- 📊 Provides tools for:
-  - Pod and node metric summaries
-  - CrashLoop detection
-  - Disk pressure alerts
-  - CPU/memory anomaly detection
-  - Correlated metric analysis
-  - Event timelines and trend detection
-- 🧩 Ready for integration with any monitoring chatbot
-
----
 
 ## ⚙️ Prerequisites
 
@@ -45,7 +28,7 @@ mcp_server_url: "http://localhost:8001/mcp"
 
 # LLM Configuration
 ollama_url: "http://localhost:11434"
-ollama_model: "qwen2.5-coder:14b"
+ollama_model: "qwen2.5-coder:7b"
 
 # Prometheus Instances
 prometheus_instances:
@@ -53,16 +36,43 @@ prometheus_instances:
     base_url: "http://localhost:9090"
     headers: {}
     disable_ssl: false
-
-  - name: prometheus_2
-    base_url: "http://localhost:9091"
-    headers: {}
-    disable_ssl: false
 ```
 
-##  Setting Up Prometheus on Two Minikube Clusters
+##  Setting Up Prometheus
 
-You can simulate a multi-cluster environment using two Minikube clusters:
+You can setup prometheus using docker by following the below steps
+
+```bash
+cat <<EOF > write.yml
+global:
+  scrape_interval: 15s
+
+remote_write:
+  - url: "http://localhost:9090/api/v1/write"
+    queue_config:
+      max_samples_per_send: 100000
+      capacity: 100000
+
+storage:
+  tsdb:
+    out_of_order_time_window: 15d
+EOF
+```
+
+Run on docker
+
+```bash
+docker run -d \
+  --name prometheus \
+  -p 9090:9090 \
+  -v $(pwd)/write.yml:/etc/prometheus/prometheus.yml \
+  prom/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --web.enable-remote-write-receiver
+```
+
+
+You can also simulate a multi-cluster environment using two Minikube clusters (Optional):
 
 ```yaml
 # Create two clusters
@@ -100,21 +110,14 @@ fastmcp run server.py:app --transport http --port 8001
 Run the client
 
 ```bash
-python3 client_dynamic.py
+python3 client_static.py
 ```
 
-## 🧪 Running Tests
+## 🧪 Sample Tool Calls 
 
-Validate all MCP tools using the provided integration test suite:
 
 ```bash
-pytest -v test_mcp_tools.py
+1) Get top 5 pods by cpu usage
+2) What is the health of the cluster
+3) Get node disk usage info for last 10 minutes
 ```
-
-This test suite:
-
-Iterates through all MCP tools
-
-Calls each tool via the MCP API
-
-Verifies each tool returns a valid JSON response
