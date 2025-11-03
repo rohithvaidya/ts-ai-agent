@@ -4,7 +4,11 @@ prometheus_instances:
     headers: {}
     disable_ssl: false
 
-  - name: prometheus_2
-    base_url: "http://localhost:9091"
-    headers: {}
-    disable_ssl: false
+summary_levels:
+  node:
+    - kube_node_status_condition
+    - kube_node_status_capacity_memory_bytes 
+  pod:
+    - kube_pod_container_status_restarts_total
+  container:
+    - container_cpu_usage_seconds_total

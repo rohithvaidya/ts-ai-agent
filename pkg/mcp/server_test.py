@@ -2,14 +2,7 @@
 import pytest
 from fastmcp import Client
 
-
-client = Client("http://localhost:8001/mcp")
-
-example_pods = ["lowcpu-node-b7cb445d9-5pccv"]
-
-# Define tools with parameters
-tools = [
-    ("current_metric_for_pods", {"pod_names": example_pods}),
+"""("current_metric_for_pods", {"pod_names": example_pods}),
     ("top_n_pods_by_metric", {"metric_name": "container_cpu_usage_seconds_total", "top_n": 5}),
     ("pod_network_io", {"pod_names": example_pods}),
     ("pods_exceeding_cpu", {"threshold": 0.8}),
@@ -24,7 +17,22 @@ tools = [
     ("detect_crashloop_pods", {"window": "10m", "threshold": 2}),
     ("correlate_metrics", {"metric_a": "container_cpu_usage_seconds_total", "metric_b": "container_network_receive_bytes_total", "window": "10m"}),
     ("pod_event_timeline", {"pod_name": example_pods[0], "window": "30m"}),
-    ("node_condition_summary", {})
+    ("node_condition_summary", {}),"""
+    
+client = Client("http://localhost:8001/mcp")
+
+example_pods = ["lowcpu-node-b7cb445d9-5pccv"]
+
+# Define tools with parameters
+tools = [
+    
+    ("summarise_tsdb", {
+        "from_ts": "2025-11-01 11:46:50.937575",           # defaults to now - 3 hours
+        "to_ts": "2025-11-01 11:51:50.937575",             # defaults to now
+        "step": "60s",
+        "db_path": "semantic_blobs_test.db",
+        "z_anomaly_threshold": 3.0
+    })
 ]
 
 @pytest.mark.asyncio

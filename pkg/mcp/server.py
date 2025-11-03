@@ -12,6 +12,14 @@ from prometheus_api_client import PrometheusConnect
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.query_api import QueryApi
 
+import sqlite3
+import uuid
+import numpy as np
+import json
+from dateutil import parser as dateparser
+from datetime import timezone
+
+
 app = FastMCP("Monitoring MCP Server")
 
 prometheus_clients: Dict[str, PrometheusConnect] = {}
@@ -510,6 +518,349 @@ def node_condition_summary():
 
     return {"node_condition_summary_per_prometheus": all_results, "timestamp": datetime.now().isoformat()}
 
+
+
+def _ensure_sqlite_db(db_path="semantic_blobs.db"):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS semantic_blobs (
+        id TEXT PRIMARY KEY,
+        cluster TEXT,
+        level TEXT,
+        metric TEXT,
+        window TEXT,
+        blob_json TEXT,
+        created_at TEXT
+    )
+    """)
+    conn.commit()
+    return conn
+
+def _iso_now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+def _parse_time_or_default(ts: Optional[str], default: datetime):
+    if ts is None:
+        return default
+    try:
+        return dateparser.isoparse(ts)
+    except Exception:
+        return default
+
+# mapping which label identifies the entity at each level
+LEVEL_LABEL_MAP = {
+    "cluster": "cluster",
+    "namespace": "namespace",
+    "pod": "pod",
+    "container": "container",
+    "app": "app"
+}
+
+# default metrics per level (used if config missing)
+DEFAULT_SUMMARY_METRICS = {
+    "cluster": ["container_cpu_usage_seconds_total", "container_memory_usage_bytes"],
+    "namespace": ["container_cpu_usage_seconds_total", "container_memory_usage_bytes"],
+    "pod": ["container_cpu_usage_seconds_total", "container_memory_usage_bytes", "kube_pod_container_status_restarts_total"],
+    "container": ["container_cpu_usage_seconds_total", "container_memory_usage_bytes", "container_network_transmit_bytes_total", "container_network_receive_bytes_total"]
+}
+
+@app.tool()
+def summarise_tsdb(
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
+    step: str = "60s",
+    db_path: str = "semantic_blobs.db",
+    z_anomaly_threshold: float = 3.0
+) -> Dict[str, Any]:
+    """
+    Summarize Prometheus time series into LLM-friendly JSON blobs and store them in sqlite.
+    - from_ts, to_ts: ISO strings. Default: to_ts = now UTC, from_ts = now - 3 hours.
+    - step: Prometheus query_range step (default 60s).
+    - Reads 'summary_levels' mapping from prometheus_config.yaml (fallback to defaults).
+    """
+
+    if not prometheus_clients:
+        return {"error": "No Prometheus clients initialized"}
+
+    # Parse times
+    now = datetime.now(timezone.utc)
+    default_to = now
+    default_from = now - timedelta(hours=3)
+
+    end_dt = _parse_time_or_default(to_ts, default_to)
+    start_dt = _parse_time_or_default(from_ts, default_from)
+
+    # Read config for summary levels & metrics
+    prom_cfg = load_config()
+    summary_levels = prom_cfg.get("summary_levels", DEFAULT_SUMMARY_METRICS)
+
+    conn = _ensure_sqlite_db(db_path)
+    cur = conn.cursor()
+
+    stored_blob_ids = []
+    # temporary in-memory mapping to help link children -> parents
+    blobs_by_level_and_entity = {}  # e.g. ("pod","api-123") -> blob_id
+
+    for prom_name, client in prometheus_clients.items():
+        # iterate configured levels
+        for level, metrics in summary_levels.items():
+            label_key = LEVEL_LABEL_MAP.get(level, level)
+            for metric in metrics:
+                try:
+                    # query Prometheus for range series grouped by the label_key (we fetch all series and then group)
+                    # Using query_range for richness; fallback to avg_over_time if query_range not available.
+                    # We'll request step as provided.
+                    query = metric
+                    # Make a ranged query: the Prometheus API returns series; use client.custom_query_range
+                    raw = []
+                    try:
+                        raw = client.custom_query_range(query=query, start_time=start_dt, end_time=end_dt, step=step)
+                    except Exception:
+                        # fallback to fetching instant avg_over_time per entity (less ideal)
+                        window = f"{int((end_dt - start_dt).total_seconds())}s"
+                        fallback_q = f'avg_over_time({metric}[{window}])'
+                        raw = client.custom_query(fallback_q)
+
+                    # raw is list of series objects. Each has "metric" dict and "values" (for range) or "value" (instant)
+                    # Build per-entity timeseries
+                    per_entity = {}
+                    for series in raw:
+                        metric_meta = series.get("metric", {})
+                        if label_key not in metric_meta:
+                            # Skip series that don't correspond to this level's label
+                            continue
+                        entity = metric_meta.get(label_key)
+                        # extract timeseries datapoints
+                        values = []
+                        if "values" in series:
+                            # range result: list of [ts, value] pairs
+                            for ts_val in series["values"]:
+                                try:
+                                    values.append((float(ts_val[0]), float(ts_val[1])))
+                                except Exception:
+                                    continue
+                        elif "value" in series:
+                            # instant result - single point; expand to a single item
+                            try:
+                                ts = float(series["value"][0])
+                                val = float(series["value"][1])
+                                values.append((ts, val))
+                            except Exception:
+                                pass
+                        if not values:
+                            continue
+                        per_entity.setdefault(entity, []).extend(values)
+
+                    # For each entity, compute stats and create blob
+                    for entity, timeseries in per_entity.items():
+                        # Sort by time, dedupe by time if duplicates
+                        timeseries = sorted({t: v for t, v in timeseries}.items())
+                        times = np.array([t for t, v in timeseries], dtype=float)
+                        vals = np.array([v for t, v in timeseries], dtype=float)
+
+                        if len(vals) == 0:
+                            continue
+
+                        mean_v = float(np.mean(vals))
+                        std_v = float(np.std(vals))
+                        # Trend: linear slope over normalized time
+                        if len(times) >= 2 and np.ptp(times) > 0:
+                            # normalize times to seconds relative to start to avoid numeric issues
+                            times_norm = (times - times[0]) / max(1.0, np.ptp(times))
+                            try:
+                                slope, intercept = np.polyfit(times_norm, vals, 1)
+                                trend = "increasing" if slope > 0 else ("decreasing" if slope < 0 else "stable")
+                            except Exception:
+                                trend = "stable"
+                        else:
+                            trend = "stable"
+
+                        # anomaly detection via z-score
+                        anomalies = []
+                        if std_v > 0:
+                            z_scores = (vals - mean_v) / std_v
+                            anomalous_indices = np.where(np.abs(z_scores) > z_anomaly_threshold)[0]
+                            for idx in anomalous_indices:
+                                anomalies.append({
+                                    "timestamp": datetime.fromtimestamp(float(times[idx]), tz=timezone.utc).isoformat(),
+                                    "value": float(vals[idx]),
+                                    "z_score": float(round(z_scores[idx], 3))
+                                })
+
+                        start_iso = start_dt.isoformat()
+                        end_iso = end_dt.isoformat()
+                        window_str = f"{start_iso}/{end_iso}"
+
+                        # blob id: deterministic-ish
+                        blob_id = str(uuid.uuid4())
+                        blob = {
+                            "id": blob_id,
+                            "level": level,
+                            "cluster": prom_name,
+                            "entity": entity,
+                            "metric": metric,
+                            "window": window_str,
+                            "mean": mean_v,
+                            "stddev": std_v,
+                            "trend": trend,
+                            "anomaly": anomalies,
+                            "child_refs": [],    # populated after all blobs collected
+                            "sample_count": int(len(vals)),
+                            "created_at": _iso_now_utc()
+                        }
+
+                        # store mapping for linking
+                        blobs_by_level_and_entity.setdefault(level, {})[ (prom_name, entity, metric, window_str) ] = blob_id
+
+                        # save blob to sqlite
+                        cur.execute(
+                            "INSERT OR REPLACE INTO semantic_blobs (id, cluster, level, metric, window, blob_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (blob_id, prom_name, level, metric, window_str, json.dumps(blob), blob["created_at"])
+                        )
+                        conn.commit()
+                        stored_blob_ids.append(blob_id)
+
+                except Exception as exc:
+                    # keep processing other metrics/levels even on error
+                    print(f"[summarise_tsdb] error processing {prom_name}/{level}/{metric}: {exc}")
+
+    # Build parent-child links (container -> pod -> namespace -> cluster)
+    # We'll load all blobs and create child_refs by matching labels present inside blob entity relationships.
+    cur.execute("SELECT id, blob_json FROM semantic_blobs")
+    rows = cur.fetchall()
+    id_to_blob = {}
+    for _id, blob_json in rows:
+        try:
+            b = json.loads(blob_json)
+            id_to_blob[_id] = b
+        except Exception:
+            continue
+
+    # Helper: find blob ids for a given level and entity
+    def find_blob_ids_for(level_name, cluster_name=None, entity_value=None, metric_name=None, window_str=None):
+        res = []
+        for _id, b in id_to_blob.items():
+            if b.get("level") != level_name:
+                continue
+            if cluster_name and b.get("cluster") != cluster_name:
+                continue
+            if entity_value and b.get("entity") != entity_value:
+                continue
+            if metric_name and b.get("metric") != metric_name:
+                continue
+            if window_str and b.get("window") != window_str:
+                continue
+            res.append((_id, b))
+        return res
+
+    # Populate child_refs:
+    # container -> pod
+    # pod -> namespace
+    # namespace -> cluster (not strictly necessary; cluster is top-level)
+    for _id, blob in id_to_blob.items():
+        lvl = blob.get("level")
+        cluster = blob.get("cluster")
+        ent = blob.get("entity")
+        window_str = blob.get("window")
+        if lvl == "container":
+            # find pod-level blobs in same cluster and window where entity equals pod label
+            # but we need pod label: we don't have labels for parent in blob; so we attempt a naming heuristic: if container entity contains pod name? 
+            # Instead, try to find pod-level blobs with the same metric and same window that contain that container via scanning pod blobs for matching container in anomaly? 
+            # Better approach: Use Prometheus label relationships - we attempt to query a mapping series to find parent pod for this container.
+            # We'll try a lightweight mapping query to Prometheus: find most common pod for this container in the time window.
+            try:
+                mapping_q = f'topk(1, count by (pod) (container_cpu_usage_seconds_total{{container="{ent}"}}))'
+                for prom_name, client in prometheus_clients.items():
+                    if prom_name != cluster:
+                        continue
+                    try:
+                        mapping_res = client.custom_query(mapping_q)
+                        if mapping_res:
+                            pod_name = mapping_res[0].get("metric", {}).get("pod")
+                            if pod_name:
+                                parents = find_blob_ids_for("pod", cluster_name=cluster, entity_value=pod_name, window_str=window_str)
+                                if parents:
+                                    # pick first parent
+                                    parent_id = parents[0][0]
+                                    # update child's blob
+                                    blob["child_refs"] = blob.get("child_refs", [])
+                                    # container should reference parent? The original design had child_refs pointing to children;
+                                    # We'll treat child_refs as references to related blobs. For container, reference its pod parent.
+                                    blob["child_refs"].append(parent_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        elif lvl == "pod":
+            # find container blobs in same cluster and window whose labels indicate they belong to this pod
+            # simple heuristic: search container-level blobs where we can find a mapping: count by (container) with pod label equals this pod.
+            try:
+                # query which containers have this pod label in the window
+                # Use instant query to find containers with this pod label
+                containers = []
+                for prom_name, client in prometheus_clients.items():
+                    if prom_name != cluster:
+                        continue
+                    q = f'count by (container) (container_cpu_usage_seconds_total{{pod="{ent}"}})'
+                    try:
+                        res = client.custom_query(q)
+                        for r in res:
+                            cont = r.get("metric", {}).get("container")
+                            if cont:
+                                containers.append(cont)
+                    except Exception:
+                        continue
+                # match containers to container-level blobs and add child_refs
+                for cont in containers:
+                    children = find_blob_ids_for("container", cluster_name=cluster, entity_value=cont, window_str=window_str)
+                    for child_id, _ in children:
+                        blob.setdefault("child_refs", []).append(child_id)
+            except Exception:
+                pass
+
+        elif lvl == "namespace":
+            # find pods in this namespace
+            try:
+                pods = []
+                for prom_name, client in prometheus_clients.items():
+                    if prom_name != cluster:
+                        continue
+                    q = f'count by (pod) (container_cpu_usage_seconds_total{{namespace="{ent}"}})'
+                    try:
+                        res = client.custom_query(q)
+                        for r in res:
+                            p = r.get("metric", {}).get("pod")
+                            if p:
+                                pods.append(p)
+                    except Exception:
+                        continue
+                for p in pods:
+                    children = find_blob_ids_for("pod", cluster_name=cluster, entity_value=p, window_str=window_str)
+                    for child_id, _ in children:
+                        blob.setdefault("child_refs", []).append(child_id)
+            except Exception:
+                pass
+
+        # update blob in DB if child_refs added
+        try:
+            cur.execute("UPDATE semantic_blobs SET blob_json = ? WHERE id = ?", (json.dumps(blob), _id))
+            conn.commit()
+        except Exception:
+            pass
+
+    conn.close()
+
+    print("[summarise_tsdb] Stored blobs:", len(stored_blob_ids))
+
+    return {
+        "stored_blobs_count": len(stored_blob_ids),
+        "db_path": db_path,
+        "from": start_dt.isoformat(),
+        "to": end_dt.isoformat(),
+        "timestamp": _iso_now_utc()
+    }
 
 
 if __name__ == "__main__":
