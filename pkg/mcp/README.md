@@ -85,6 +85,8 @@ Push some sample data using utils/prometheus_data_pusher
   "batch_size": 20,
   "days_of_history": 1
 }
+
+python3 prometheus_data_pusher.py --config config.json
 ```
 
 You can also simulate a multi-cluster environment using two Minikube clusters (Optional):
