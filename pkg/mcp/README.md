@@ -71,6 +71,21 @@ docker run -d \
   --web.enable-remote-write-receiver
 ```
 
+Push some sample data using utils/prometheus_data_pusher
+```bash
+{
+  "prometheus_url": "http://localhost:9090/api/v1/write",
+  "auth_token": null,
+  "num_clusters": 2,
+  "nodes_per_cluster": 2,
+  "namespaces_per_cluster": 2,
+  "pods_per_namespace": 2,
+  "containers_per_pod": 1,
+  "scrape_interval": 120,
+  "batch_size": 20,
+  "days_of_history": 1
+}
+```
 
 You can also simulate a multi-cluster environment using two Minikube clusters (Optional):
 
